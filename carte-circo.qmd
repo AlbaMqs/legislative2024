@@ -1,0 +1,34 @@
+---
+title: "Carte"
+author: "Alba Maiques"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Base de données
+
+```{r}
+library(readxl)
+library(httr)
+library(tidyverse)
+
+url <- "https://static.data.gouv.fr/resources/elections-legislatives-des-12-et-19-juin-2022-resultats-definitifs-du-premier-tour/20220614-192518/resultats-par-niveau-cirlg-t1-france-entiere.xlsx"
+
+temp_file <- tempfile(fileext = ".xlsx")
+GET(url, write_disk(temp_file, overwrite = TRUE))
+
+circo <- read_xlsx(temp_file)
+
+unlink(temp_file)
+rm(temp_file, url)
+```
+
+```{r}
+circo |> 
+  select(matches("^\\.{3}")) |> 
+  mutate(across(everything(), as.character)) |> 
+  pivot_longer(everything()) |> 
+  View()
+```
