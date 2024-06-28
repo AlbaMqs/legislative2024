@@ -13,6 +13,11 @@ editor_options:
 library(readxl)
 library(httr)
 library(tidyverse)
+library(sf)
+library(here)
+library(patchwork)
+library(ggplot2)
+library(leaflet)
 
 url <- "https://static.data.gouv.fr/resources/elections-legislatives-des-12-et-19-juin-2022-resultats-definitifs-du-premier-tour/20220614-192518/resultats-par-niveau-cirlg-t1-france-entiere.xlsx"
 
@@ -21,14 +26,187 @@ GET(url, write_disk(temp_file, overwrite = TRUE))
 
 circo <- read_xlsx(temp_file)
 
+france <- read_sf(here("carte", "circonscriptions_legislatives_030522.shp"))
+
 unlink(temp_file)
 rm(temp_file, url)
 ```
 
 ```{r}
-circo |> 
-  select(matches("^\\.{3}")) |> 
+nom_col <- circo |> 
+  select(20:28) |> 
+  names()
+
+rename.candidat <- function(col){
+  ind <- str_extract(col, "\\d+") |> 
+    as.numeric()
+  
+  ind <- ind - 20
+  mod <- (ind %% 9) + 1
+  ind <- floor(ind/9) + 1
+  
+  nom <- paste0(ind, "_", nom_col[mod])
+  return(nom)
+}
+
+circo <- circo |> 
+  rename_with(~ paste0("1_", .x),
+              20:28) |> 
+  rename_with(rename.candidat,
+              matches("^\\.{3}"))
+```
+
+```{r}
+candidat <- circo |> 
   mutate(across(everything(), as.character)) |> 
-  pivot_longer(everything()) |> 
-  View()
+  pivot_longer(matches("\\d+_")) |> 
+  mutate(candidat = str_extract(name, "^\\d+"),
+         name = str_remove(name, "^\\d+_")) |> 
+  pivot_wider() |> 
+  filter(!is.na(Nom))
+
+candidat <- candidat %>%
+  mutate(
+    orientation = case_when(
+      Nuance %in% c("DVD", "DXD", "LR", "REC", "RN", "UDI") ~ "droite",
+      Nuance %in% c("DVC", "ENS") ~ "centre",
+      Nuance %in% c("DVG", "DXG", "NUP", "RDG") ~ "gauche",
+      Nuance %in% c("DIV", "DSV", "ECO", "REG") ~ "autres",
+      TRUE ~ NA_character_  # Valeur par défaut si aucune condition n'est remplie
+    )
+  )
+
+resultat <- candidat |> 
+  mutate(Voix = as.numeric(Voix),
+         Exprimés = as.numeric(Exprimés),
+         resultat = Voix/Exprimés * 100) |> 
+  group_by(`Code du département`, `Code de la circonscription`, orientation) |> 
+  summarise(score = sum(resultat)) |> 
+  pivot_wider(names_from = "orientation", values_from = "score")
+
+
+```
+
+```{r}
+passe <- candidat |>
+  mutate(Voix = as.numeric(Voix),
+         Inscrits = as.numeric(Inscrits),
+         passe = ifelse((Voix/Inscrits * 100) >= 12.5,
+                        TRUE,
+                        FALSE)) |>
+  distinct(`Code du département`,
+           `Code de la circonscription`,
+           orientation,
+           passe) |>
+  filter(passe) |>
+  pivot_wider(names_from = "orientation", values_from = "passe") |>
+  mutate(across(centre:autres,
+                ~ ifelse(is.na(.), FALSE, .),
+                .names = "{.col}.passe")) |>
+  select(-c("centre", "autres", "gauche", "droite"))
+
+resultat <- resultat |> 
+  select(-matches("passe$")) |> 
+  left_join(passe)
+
+resultat <- resultat |> 
+  ungroup() |> 
+  mutate(type = rowSums(across(matches('passe$')), na.rm = TRUE),
+         type = case_when(type == 1 ~ "Majorité",
+                          type == 2 ~ "Second tour",
+                          type == 3 ~ "Triangulaire"))
+```
+
+```{r}
+plot.carte.scale <- function(df, fill, color.min, color.max, titre) {
+  # Convertir le système de coordonnées en WGS84
+  df <- st_transform(df, crs = 4326)
+  
+  # Filtrer l'Île-de-France (départements 75, 77, 78, 91, 92, 93, 94, 95)
+  ile_de_france_deps <- c("75", "77", "78", "91", "92", "93", "94", "95")
+  ile_de_france <- df[df$dep %in% ile_de_france_deps, ]
+  
+  # Filtrer la France métropolitaine
+  metropole <- df
+  
+  # Définir les limites de la France métropolitaine
+  metropole_bounds <- st_bbox(c(xmin = -5, xmax = 10, ymin = 41, ymax = 52), crs = st_crs(4326))
+  
+  # Créer la carte de la France métropolitaine
+  plot_metropole <- ggplot(metropole) +
+    geom_sf(aes_string(fill = fill), color = NA) +  # Remplissage sans contours
+    geom_sf(fill = NA, color = "white", size = 0.2, alpha = 0.5) +  # Contours blancs avec opacité réduite
+    scale_fill_gradient(low = color.min, high = color.max, limits = c(0, 100), name = titre) +
+    coord_sf(xlim = c(metropole_bounds["xmin"], metropole_bounds["xmax"]), 
+             ylim = c(metropole_bounds["ymin"], metropole_bounds["ymax"])) +
+    theme_void()
+  
+  # Créer la carte zoomée sur l'Île-de-France avec un facteur de zoom de 4
+  idf_bounds <- st_bbox(ile_de_france)
+  idf_center <- c((idf_bounds["xmin"] + idf_bounds["xmax"]) / 2, (idf_bounds["ymin"] + idf_bounds["ymax"]) / 2)
+  zoom_factor <- 4
+  idf_zoomed_bounds <- c(
+    xmin = idf_center[1] - (idf_bounds["xmax"] - idf_bounds["xmin"]) / (2 * zoom_factor),
+    xmax = idf_center[1] + (idf_bounds["xmax"] - idf_bounds["xmin"]) / (2 * zoom_factor),
+    ymin = idf_center[2] - (idf_bounds["ymax"] - idf_bounds["ymin"]) / (2 * zoom_factor),
+    ymax = idf_center[2] + (idf_bounds["ymax"] - idf_bounds["ymin"]) / (2 * zoom_factor)
+  )
+  
+  plot_ile_de_france <- ggplot(ile_de_france) +
+    geom_sf(aes_string(fill = fill), color = NA) +  # Remplissage sans contours
+    geom_sf(fill = NA, color = "white", size = 0.2, alpha = 0.5) +  # Contours blancs avec opacité réduite
+    scale_fill_gradient(low = color.min, high = color.max, limits = c(0, 100), guide = "none") +
+    coord_sf(xlim = c(idf_zoomed_bounds["xmin"], idf_zoomed_bounds["xmax"]), 
+             ylim = c(idf_zoomed_bounds["ymin"], idf_zoomed_bounds["ymax"])) +
+    theme_void() +
+    guides(fill = "none")
+  
+  # Combiner les cartes avec patchwork et décaler l'encart de l'Île-de-France légèrement à droite
+  final_plot <- plot_metropole +
+    inset_element(plot_ile_de_france, left = 0.75, bottom = 0.7, right = 1.05, top = 1)
+  
+  # Afficher la carte finale
+  print(final_plot)
+}
+
+# Exemple d'utilisation de la fonction avec un fichier shapefile et une variable fill
+# plot.carte.scale(df = france, fill = "variable_name", color.min = "blue", color.max = "red", titre = "Titre de la légende")
+
+```
+
+```{r}
+resultat <- resultat |> 
+  mutate(id_circo = paste0(`Code du département`, `Code de la circonscription`))
+
+france <- france |> 
+  left_join(resultat)
+
+plot.carte.scale(france, "gauche", "blue", "red", "Score de la gauche")
+```
+
+```{r}
+plot.carte.scale <- function(df, fill, color.min, color.max, titre) {
+  # Convertir le système de coordonnées en WGS84
+  df <- st_transform(df, crs = 4326)
+  
+  # Créer une palette de couleurs pour le remplissage
+  pal <- colorNumeric(palette = c(color.min, color.max), domain = c(0, 100))
+  
+  # Créer la carte interactive
+  leaflet(df) %>%
+    addTiles() %>%
+    addPolygons(
+      fillColor = ~pal(get(fill)),  # Utiliser la palette pour le remplissage
+      fillOpacity = 1,              # Opacité du remplissage
+      color = "white",              # Couleur des contours
+      weight = 0.5,                 # Épaisseur des contours
+      opacity = 0.5,                # Opacité des contours
+      popup = ~paste(titre, ": ", get(fill))  # Ajouter des popups pour afficher la valeur du fill
+    ) %>%
+    addLegend(
+      pal = pal, values = c(0, 100), title = titre, opacity = 1
+    )
+}
+
+plot.carte.scale(france, "gauche", "blue", "red", "Score de la gauche")
 ```
